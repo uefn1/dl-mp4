@@ -1,0 +1,150 @@
+name: Upload Video to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '動画の直リンクURL（.mp4）'
+        required: true
+        type: string
+      tag_name:
+        description: 'Releaseタグ名（空欄なら日時から自動生成）'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ランナーの空き容量を確保（標準は約14GB）
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Ensure FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Download MP4
+        id: download
+        run: |
+          mkdir -p output
+
+          # URLからファイル名を抽出（クエリ除去、拡張子がなければ .mp4 を補完）
+          URL="${{ inputs.video_url }}"
+          FILENAME=$(basename "${URL%%\?*}")
+          # 拡張子が .mp4 でなければ .mp4 を付ける
+          case "$FILENAME" in
+            *.mp4|*.MP4) ;;
+            *) FILENAME="${FILENAME}.mp4" ;;
+          esac
+          # 安全な名前に（スペース等を除去）
+          FILENAME=$(echo "$FILENAME" | tr -c 'A-Za-z0-9._-' '_')
+          VIDEO_FILE="output/${FILENAME}"
+
+          echo "Downloading: $URL -> $VIDEO_FILE"
+          curl -fL --retry 3 --retry-delay 5 -o "$VIDEO_FILE" "$URL"
+
+          SIZE=$(stat -c%s "$VIDEO_FILE")
+          echo "video_file=$VIDEO_FILE" >> "$GITHUB_OUTPUT"
+          echo "base_name=$(basename "$VIDEO_FILE" | sed 's/\.[^.]*$//')" >> "$GITHUB_OUTPUT"
+          echo "file_size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "Downloaded $SIZE bytes"
+
+      - name: Decide upload mode
+        id: mode
+        run: |
+          SIZE=${{ steps.download.outputs.file_size }}
+          LIMIT=$((1900 * 1024 * 1024))  # 1.9 GiB
+
+          if [ "$SIZE" -lt "$LIMIT" ]; then
+            echo "mode=mp4" >> "$GITHUB_OUTPUT"
+            echo "→ ${SIZE} bytes < 1.9 GiB: MP4のままアップロード"
+          else
+            echo "mode=ts" >> "$GITHUB_OUTPUT"
+            echo "→ ${SIZE} bytes >= 1.9 GiB: .tsに分割してアップロード"
+          fi
+
+      # ----- 1.9 GiB未満: MP4のまま -----
+      - name: Upload MP4 directly
+        if: steps.mode.outputs.mode == 'mp4'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          [ -z "$TAG" ] && TAG="video-$(date +'%Y%m%d-%H%M%S')"
+
+          gh release create "$TAG" \
+            --title "Video: $TAG" \
+            --notes "Uploaded from workflow_dispatch" \
+            --draft=false --prerelease=false
+
+          gh release upload "$TAG" "${{ steps.download.outputs.video_file }}" --clobber
+
+      # ----- 1.9 GiB以上: .tsに分割 -----
+      - name: Split into TS segments
+        if: steps.mode.outputs.mode == 'ts'
+        id: split
+        run: |
+          VIDEO_FILE="${{ steps.download.outputs.video_file }}"
+          BASE_NAME="${{ steps.download.outputs.base_name }}"
+          mkdir -p segments
+
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE")
+          BITRATE=$(ffprobe -v error -show_entries format=bit_rate -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE")
+
+          # 各セグメントが1.9GiB未満になる秒数を逆算（安全係数0.95）
+          SEGMENT_TIME=$(python3 -c "
+          duration = float('$DURATION')
+          bitrate  = float('$BITRATE')
+          max_bytes = 1.9 * 1024**3 * 0.95
+          seg = (max_bytes * 8) / bitrate
+          seg = max(10, min(seg, duration))
+          print(int(seg))
+          ")
+
+          echo "duration=${DURATION}s, bitrate=${BITRATE}bps, segment_time=${SEGMENT_TIME}s"
+
+          ffmpeg -i "$VIDEO_FILE" \
+            -map 0 -codec copy \
+            -f segment \
+            -segment_time "$SEGMENT_TIME" \
+            -segment_list "segments/${BASE_NAME}.m3u8" \
+            -segment_format mpegts \
+            "segments/${BASE_NAME}_%03d.ts"
+
+          ls -lh segments/
+          echo "segments_dir=segments" >> "$GITHUB_OUTPUT"
+
+      - name: Upload TS segments
+        if: steps.mode.outputs.mode == 'ts'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          [ -z "$TAG" ] && TAG="video-$(date +'%Y%m%d-%H%M%S')"
+
+          gh release create "$TAG" \
+            --title "Video: $TAG" \
+            --notes "Split into TS segments (each < 1.9 GiB)" \
+            --draft=false --prerelease=false
+
+          gh release upload "$TAG" segments/*.ts segments/*.m3u8 --clobber
